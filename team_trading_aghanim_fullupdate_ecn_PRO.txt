@@ -1,0 +1,912 @@
+//+------------------------------------------------------------------+
+//|                                          Team Trading EA.mq4      |
+//|                    Optimized - No Sleep + Retry Mechanism         |
+//+------------------------------------------------------------------+
+#property copyright "Team Trading EA - Optimized"
+#property version   "4.00"
+#property strict
+
+// Input Parameters
+input double   InitialLot = 0.01;        // Lot awal
+input double   LotIncrement = 0.01;      // Penambahan lot setelah SL
+input int      StopLossPips = 100;       // Jarak SL dalam pips
+input double   ReverseLot = 0.40;        // Lot untuk trigger reverse
+input double   ProfitPerLot = 100.0;     // Target profit per lot dalam USD
+input int      MagicNumberRed = 1001;    // Magic number tim Red
+input int      MagicNumberBlue = 2001;   // Magic number tim Blue
+
+// Aghanim's Scepter Settings
+input bool     EnableAghanimScepter = false;  // Enable Aghanim's Scepter
+input double   AghanimTriggerLot = 0.30;      // Lot untuk aktivasi Aghanim
+
+// Trading Hours Settings
+input bool     EnableTradingHours = false;    // Enable Trading Hours
+input int      StartHour = 0;                 // Jam Mulai Trading (0-23)
+input int      StartMinute = 0;               // Menit Mulai Trading (0-59)
+input int      PauseHour = 23;                // Jam Pause Trading (0-23)
+input int      PauseMinute = 59;              // Menit Pause Trading (0-59)
+
+// Optimization Settings
+// ====================================================================
+// BROKER SPEED RECOMMENDATIONS:
+// Fast Broker (ECN/Low Latency):    MaxRetries=3,  RetryDelay=100
+// Medium Broker (Standard):         MaxRetries=5,  RetryDelay=150
+// Slow Broker (High Latency):       MaxRetries=7,  RetryDelay=200
+// Very Slow Broker (Problematic):   MaxRetries=10, RetryDelay=300
+// ====================================================================
+input int      MaxRetries = 5;                // Max retry untuk OrderSend/Modify (3-15)
+input int      RetryDelay = 150;              // Delay antar retry (50-500 ms)
+
+// Global Variables
+double InitialBalance = 0;
+double TargetEquity = 0;
+bool IsInitialized = false;
+bool ShowStatusUpdate = false;
+
+// Team Status
+string RedTeamDirection = "SELL";
+string BlueTeamDirection = "BUY";
+double RedLastLot = 0;
+double BlueLastLot = 0;
+
+// Aghanim's Scepter Variables
+bool AghanimActive = false;
+double TotalLossFromInitial = 0;
+double BalanceAtAghanimActivation = 0;
+bool AghanimTriggeredRed = false;
+bool AghanimTriggeredBlue = false;
+
+// Trading Hours Variables
+bool IsTrading = true;
+bool IsPaused = false;
+bool WaitingForOrdersToClose = false;
+
+// Optimization Variables
+uint LastTickCount = 0;
+int TickCounter = 0;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                     |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   InitialBalance = AccountBalance();
+   IsInitialized = false;
+   AghanimActive = false;
+   TotalLossFromInitial = 0;
+   BalanceAtAghanimActivation = 0;
+   AghanimTriggeredRed = false;
+   AghanimTriggeredBlue = false;
+   IsTrading = true;
+   IsPaused = false;
+   WaitingForOrdersToClose = false;
+   LastTickCount = 0;
+   TickCounter = 0;
+   
+   Print("========================================");
+   Print("EA Initialized - OPTIMIZED VERSION");
+   Print("Initial Balance: $", DoubleToString(InitialBalance, 2));
+   Print("Aghanim's Scepter: ", EnableAghanimScepter ? "ENABLED" : "DISABLED");
+   if(EnableAghanimScepter)
+   {
+      Print("Aghanim Trigger Lot: ", DoubleToString(AghanimTriggerLot, 2));
+   }
+   
+   if(EnableTradingHours)
+   {
+      Print("Trading Hours: ENABLED");
+      Print("Start Time: ", IntegerToString(StartHour, 2, '0'), ":", IntegerToString(StartMinute, 2, '0'));
+      Print("Pause Time: ", IntegerToString(PauseHour, 2, '0'), ":", IntegerToString(PauseMinute, 2, '0'));
+   }
+   else
+   {
+      Print("Trading Hours: DISABLED (24/7 Trading)");
+   }
+   
+   Print("Max Retries: ", MaxRetries, " | Retry Delay: ", RetryDelay, "ms");
+   
+   // Display broker speed recommendation based on settings
+   string brokerSpeed = "Custom";
+   
+   if(MaxRetries == 3 && RetryDelay == 100)
+      brokerSpeed = "Fast Broker / ECN";
+   else if(MaxRetries == 5 && RetryDelay == 150)
+      brokerSpeed = "Standard Broker (Recommended)";
+   else if(MaxRetries == 7 && RetryDelay == 200)
+      brokerSpeed = "Slow Broker";
+   else if(MaxRetries == 10 && RetryDelay == 300)
+      brokerSpeed = "Very Slow / Problematic Broker";
+   else if(MaxRetries <= 3)
+      brokerSpeed = "Fast/Aggressive Profile";
+   else if(MaxRetries >= 10)
+      brokerSpeed = "Conservative Profile";
+   
+   Print("Optimization Profile: ", brokerSpeed);
+   
+   // Validation warnings
+   if(MaxRetries < 2)
+      Print("WARNING: MaxRetries < 2 is too aggressive. Recommended: 3+");
+   if(MaxRetries > 15)
+      Print("WARNING: MaxRetries > 15 is too conservative. Consider switching broker.");
+   if(RetryDelay < 50)
+      Print("WARNING: RetryDelay < 50ms may trigger 'Too frequent requests' error.");
+   if(RetryDelay > 500)
+      Print("WARNING: RetryDelay > 500ms is very slow. Order execution may be delayed.");
+   
+   Print("========================================");
+   
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                   |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   Print("EA Stopped");
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                               |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   TickCounter++;
+   LastTickCount = GetTickCount();
+   
+   // Check Trading Hours
+   CheckTradingHours();
+   
+   // If paused and waiting for orders to close
+   if(WaitingForOrdersToClose)
+   {
+      int totalOrders = CountOrders(MagicNumberRed) + CountOrders(MagicNumberBlue);
+      
+      if(totalOrders == 0)
+      {
+         IsPaused = true;
+         WaitingForOrdersToClose = false;
+         IsTrading = false;
+         
+         Print("========================================");
+         Print("EA PAUSED - All orders closed");
+         Print("Current Time: ", TimeToString(TimeCurrent(), TIME_DATE|TIME_MINUTES));
+         Print("Will resume at: ", IntegerToString(StartHour, 2, '0'), ":", IntegerToString(StartMinute, 2, '0'));
+         Print("========================================");
+         return;
+      }
+      else
+      {
+         // Continue monitoring but don't open new orders
+         CheckAghanimActivation();
+         CalculateTargetEquity();
+         
+         // Check if Target Equity reached during pause period
+         if(TargetEquity > 0 && AccountEquity() >= TargetEquity)
+         {
+            Print("========================================");
+            Print("TARGET EQUITY REACHED DURING PAUSE PERIOD!");
+            Print("Initial Balance: $", DoubleToString(InitialBalance, 2));
+            Print("Current Equity: $", DoubleToString(AccountEquity(), 2));
+            Print("Target Equity: $", DoubleToString(TargetEquity, 2));
+            Print("Difference: +$", DoubleToString(AccountEquity() - TargetEquity, 2));
+            
+            if(AghanimActive)
+            {
+               Print("--- AGHANIM'S SCEPTER MODE ---");
+               Print("Total Loss Recovered: $", DoubleToString(TotalLossFromInitial, 2));
+            }
+            
+            Print("========================================");
+            CloseAllOrders();
+            
+            int remainingOrders = CountOrders(MagicNumberRed) + CountOrders(MagicNumberBlue);
+            
+            if(remainingOrders == 0)
+            {
+               ResetEA();
+               IsPaused = true;
+               WaitingForOrdersToClose = false;
+               IsTrading = false;
+               
+               Print("EA PAUSED after target reached");
+            }
+            return;
+         }
+         
+         return;
+      }
+   }
+   
+   // If paused, don't do anything
+   if(IsPaused)
+   {
+      return;
+   }
+   
+   // If not in trading hours, don't open new orders
+   if(!IsTrading)
+   {
+      return;
+   }
+   
+   // Normal trading operations
+   if(!IsInitialized)
+   {
+      InitializeOrders();
+      IsInitialized = true;
+      return;
+   }
+   
+   // Check Aghanim's Scepter activation
+   CheckAghanimActivation();
+   
+   // Calculate Target Equity
+   CalculateTargetEquity();
+   
+   if(ShowStatusUpdate)
+   {
+      PrintStatus();
+      ShowStatusUpdate = false;
+   }
+   
+   // Check if Target Equity reached - STRICT VALIDATION
+   if(TargetEquity > 0 && AccountEquity() >= TargetEquity)
+   {
+      Print("========================================");
+      Print("TARGET EQUITY REACHED!");
+      Print("Initial Balance: $", DoubleToString(InitialBalance, 2));
+      Print("Current Equity: $", DoubleToString(AccountEquity(), 2));
+      Print("Target Equity: $", DoubleToString(TargetEquity, 2));
+      Print("Difference: +$", DoubleToString(AccountEquity() - TargetEquity, 2));
+      
+      if(AghanimActive)
+      {
+         Print("--- AGHANIM'S SCEPTER MODE ---");
+         Print("Total Loss Recovered: $", DoubleToString(TotalLossFromInitial, 2));
+      }
+      
+      Print("========================================");
+      CloseAllOrders();
+      ResetEA();
+      return;
+   }
+   
+   MonitorTeam(MagicNumberRed, RedTeamDirection, RedLastLot, "RED");
+   MonitorTeam(MagicNumberBlue, BlueTeamDirection, BlueLastLot, "BLUE");
+}
+
+//+------------------------------------------------------------------+
+//| Check Trading Hours                                                |
+//+------------------------------------------------------------------+
+void CheckTradingHours()
+{
+   if(!EnableTradingHours)
+   {
+      IsTrading = true;
+      IsPaused = false;
+      return;
+   }
+   
+   datetime currentTime = TimeCurrent();
+   int currentHour = TimeHour(currentTime);
+   int currentMinute = TimeMinute(currentTime);
+   
+   int currentTimeMinutes = currentHour * 60 + currentMinute;
+   int startTimeMinutes = StartHour * 60 + StartMinute;
+   int pauseTimeMinutes = PauseHour * 60 + PauseMinute;
+   
+   bool shouldBeTradingNow = false;
+   
+   if(startTimeMinutes < pauseTimeMinutes)
+   {
+      shouldBeTradingNow = (currentTimeMinutes >= startTimeMinutes && currentTimeMinutes < pauseTimeMinutes);
+   }
+   else if(startTimeMinutes > pauseTimeMinutes)
+   {
+      shouldBeTradingNow = (currentTimeMinutes >= startTimeMinutes || currentTimeMinutes < pauseTimeMinutes);
+   }
+   else
+   {
+      shouldBeTradingNow = true;
+   }
+   
+   if(!WaitingForOrdersToClose && !IsPaused && IsTrading && !shouldBeTradingNow)
+   {
+      int totalOrders = CountOrders(MagicNumberRed) + CountOrders(MagicNumberBlue);
+      
+      if(totalOrders > 0)
+      {
+         Print("========================================");
+         Print("PAUSE TIME REACHED!");
+         Print("Current Time: ", TimeToString(currentTime, TIME_DATE|TIME_MINUTES));
+         Print("Waiting for ", totalOrders, " order(s) to close before pausing...");
+         Print("========================================");
+         
+         WaitingForOrdersToClose = true;
+         IsTrading = false;
+      }
+      else
+      {
+         IsPaused = true;
+         IsTrading = false;
+         
+         Print("========================================");
+         Print("EA PAUSED - No active orders");
+         Print("Current Time: ", TimeToString(currentTime, TIME_DATE|TIME_MINUTES));
+         Print("Will resume at: ", IntegerToString(StartHour, 2, '0'), ":", IntegerToString(StartMinute, 2, '0'));
+         Print("========================================");
+      }
+   }
+   
+   if(IsPaused && shouldBeTradingNow)
+   {
+      IsPaused = false;
+      IsTrading = true;
+      WaitingForOrdersToClose = false;
+      
+      Print("========================================");
+      Print("EA RESUMED!");
+      Print("Current Time: ", TimeToString(currentTime, TIME_DATE|TIME_MINUTES));
+      Print("Trading will pause at: ", IntegerToString(PauseHour, 2, '0'), ":", IntegerToString(PauseMinute, 2, '0'));
+      Print("========================================");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Initialize first orders for both teams                             |
+//+------------------------------------------------------------------+
+void InitializeOrders()
+{
+   OpenOrder(RedTeamDirection, InitialLot, MagicNumberRed);
+   RedLastLot = InitialLot;
+   
+   OpenOrder(BlueTeamDirection, InitialLot, MagicNumberBlue);
+   BlueLastLot = InitialLot;
+   
+   Print("Initial orders opened. Red: ", RedTeamDirection, " Blue: ", BlueTeamDirection);
+   
+   ShowStatusUpdate = true;
+}
+
+//+------------------------------------------------------------------+
+//| Check Aghanim's Scepter Activation                                |
+//+------------------------------------------------------------------+
+void CheckAghanimActivation()
+{
+   if(!EnableAghanimScepter || AghanimActive)
+   {
+      return;
+   }
+   
+   if(!AghanimTriggeredRed && RedLastLot >= AghanimTriggerLot)
+   {
+      AghanimTriggeredRed = true;
+      Print(">>> RED TEAM reached Aghanim trigger lot: ", RedLastLot);
+   }
+   
+   if(!AghanimTriggeredBlue && BlueLastLot >= AghanimTriggerLot)
+   {
+      AghanimTriggeredBlue = true;
+      Print(">>> BLUE TEAM reached Aghanim trigger lot: ", BlueLastLot);
+   }
+   
+   if((AghanimTriggeredRed || AghanimTriggeredBlue) && !AghanimActive)
+   {
+      AghanimActive = true;
+      BalanceAtAghanimActivation = AccountBalance();
+      TotalLossFromInitial = InitialBalance - BalanceAtAghanimActivation;
+      
+      Print("========================================");
+      Print("*** AGHANIM'S SCEPTER ACTIVATED! ***");
+      Print("Initial Balance: $", DoubleToString(InitialBalance, 2));
+      Print("Current Balance: $", DoubleToString(BalanceAtAghanimActivation, 2));
+      Print("Total Loss: $", DoubleToString(TotalLossFromInitial, 2));
+      Print("New Target Equity: Initial + Total Loss");
+      Print("========================================");
+      
+      ShowStatusUpdate = true;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Target Equity                                           |
+//+------------------------------------------------------------------+
+void CalculateTargetEquity()
+{
+   if(AghanimActive)
+   {
+      double currentBalance = AccountBalance();
+      TotalLossFromInitial = InitialBalance - currentBalance;
+      
+      if(TotalLossFromInitial < 0)
+      {
+         TotalLossFromInitial = 0;
+      }
+      
+      TargetEquity = InitialBalance + TotalLossFromInitial;
+   }
+   else
+   {
+      double totalLot = GetTotalLot();
+      double targetProfit = totalLot * ProfitPerLot;
+      TargetEquity = InitialBalance + targetProfit;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Print Status                                                       |
+//+------------------------------------------------------------------+
+void PrintStatus()
+{
+   Print("========================================");
+   Print("--- STATUS UPDATE ---");
+   
+   if(EnableTradingHours)
+   {
+      Print("Trading Status: ", IsTrading ? "ACTIVE" : (WaitingForOrdersToClose ? "WAITING TO PAUSE" : "PAUSED"));
+      Print("Current Time: ", TimeToString(TimeCurrent(), TIME_DATE|TIME_MINUTES));
+   }
+   
+   Print("Initial Balance: $", DoubleToString(InitialBalance, 2));
+   Print("Current Balance: $", DoubleToString(AccountBalance(), 2));
+   Print("Current Equity: $", DoubleToString(AccountEquity(), 2));
+   
+   if(AghanimActive)
+   {
+      Print("--- AGHANIM'S SCEPTER MODE: ACTIVE ---");
+      Print("Total Loss from Initial: $", DoubleToString(TotalLossFromInitial, 2));
+      Print("Target Equity: $", DoubleToString(TargetEquity, 2), 
+            " (Initial + Loss)");
+   }
+   else
+   {
+      double totalLot = GetTotalLot();
+      double targetProfit = totalLot * ProfitPerLot;
+      Print("Total Lot: ", DoubleToString(totalLot, 2));
+      Print("Target Profit: $", DoubleToString(targetProfit, 2));
+      Print("Target Equity: $", DoubleToString(TargetEquity, 2));
+      
+      if(EnableAghanimScepter)
+      {
+         Print("Aghanim Status: WAITING (Trigger: ", AghanimTriggerLot, " lot)");
+         Print("  Red Team: ", RedLastLot, " | Blue Team: ", BlueLastLot);
+      }
+   }
+   
+   Print("--- Active Orders ---");
+   PrintActiveOrders();
+   Print("Tick Counter: ", TickCounter);
+   Print("========================================");
+}
+
+//+------------------------------------------------------------------+
+//| Monitor team orders                                                |
+//+------------------------------------------------------------------+
+void MonitorTeam(int magicNumber, string &direction, double &lastLot, string teamName)
+{
+   int totalOrders = CountOrders(magicNumber);
+   
+   if(totalOrders == 0)
+   {
+      double newLot = CalculateNextLot(lastLot);
+      
+      if(lastLot >= ReverseLot)
+      {
+         direction = (direction == "BUY") ? "SELL" : "BUY";
+         Print(teamName, " Team REVERSE! Last Lot: ", lastLot, " | New Direction: ", direction, " | New Lot: ", newLot);
+      }
+      else
+      {
+         Print(teamName, " Team continues: ", direction, " | New Lot: ", newLot);
+      }
+      
+      OpenOrder(direction, newLot, magicNumber);
+      lastLot = newLot;
+      
+      if(AghanimActive)
+      {
+         double currentBalance = AccountBalance();
+         TotalLossFromInitial = InitialBalance - currentBalance;
+         
+         if(TotalLossFromInitial < 0)
+         {
+            TotalLossFromInitial = 0;
+         }
+         
+         Print("Loss updated after SL: Total Loss = $", DoubleToString(TotalLossFromInitial, 2));
+      }
+      
+      ShowStatusUpdate = true;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate next lot size                                           |
+//+------------------------------------------------------------------+
+double CalculateNextLot(double currentLot)
+{
+   double nextLot = currentLot + LotIncrement;
+   
+   double minLot = MarketInfo(Symbol(), MODE_MINLOT);
+   double maxLot = MarketInfo(Symbol(), MODE_MAXLOT);
+   double lotStep = MarketInfo(Symbol(), MODE_LOTSTEP);
+   
+   nextLot = MathMax(minLot, MathMin(maxLot, nextLot));
+   nextLot = NormalizeDouble(nextLot / lotStep, 0) * lotStep;
+   
+   return nextLot;
+}
+
+//+------------------------------------------------------------------+
+//| Open new order with retry mechanism                               |
+//+------------------------------------------------------------------+
+void OpenOrder(string direction, double lots, int magicNumber)
+{
+   double point = Point;
+   if(Digits == 5 || Digits == 3)
+   {
+      point = Point * 10;
+   }
+   
+   double slDistance = StopLossPips * point;
+   double price, sl;
+   int orderType;
+   color clr;
+   
+   int attempt = 0;
+   int ticket = -1;
+   
+   while(attempt < MaxRetries && ticket < 0)
+   {
+      attempt++;
+      
+      // Refresh rates before each attempt
+      RefreshRates();
+      
+      if(direction == "BUY")
+      {
+         price = Ask;
+         sl = NormalizeDouble(price - slDistance, Digits);
+         orderType = OP_BUY;
+         clr = clrBlue;
+      }
+      else
+      {
+         price = Bid;
+         sl = NormalizeDouble(price + slDistance, Digits);
+         orderType = OP_SELL;
+         clr = clrRed;
+      }
+      
+      // Send order WITH Stop Loss directly
+      ticket = OrderSend(Symbol(), orderType, lots, price, 3, sl, 0, 
+                         "Team Trading", magicNumber, 0, clr);
+      
+      if(ticket > 0)
+      {
+         // Verify SL is set correctly
+         if(OrderSelect(ticket, SELECT_BY_TICKET))
+         {
+            double actualSlPips = 0;
+            if(direction == "BUY")
+            {
+               actualSlPips = (OrderOpenPrice() - OrderStopLoss()) / point;
+            }
+            else
+            {
+               actualSlPips = (OrderStopLoss() - OrderOpenPrice()) / point;
+            }
+            
+            Print("Order opened: ", direction, " Lot: ", lots, 
+                  " | SL: ", DoubleToString(actualSlPips, 1), " pips | Magic: ", magicNumber,
+                  " | Attempt: ", attempt);
+            
+            if(MathAbs(actualSlPips - StopLossPips) > 5)
+            {
+               Print("WARNING: SL difference detected! Target: ", StopLossPips, " Actual: ", actualSlPips);
+            }
+         }
+         
+         return; // Success!
+      }
+      else
+      {
+         int error = GetLastError();
+         
+         Print("OrderSend failed (Attempt ", attempt, "/", MaxRetries, "): Error ", error, " - ", ErrorDescription(error));
+         
+         // Handle specific errors
+         if(error == 136 || error == 137 || error == 138) // Off quotes, Broker busy, Requote
+         {
+            if(attempt < MaxRetries)
+            {
+               datetime startWait = TimeCurrent();
+               while(TimeCurrent() - startWait < RetryDelay / 1000.0)
+               {
+                  // Busy wait (lebih cepat dari Sleep)
+               }
+            }
+         }
+         else if(error == 146) // Trade context busy
+         {
+            if(attempt < MaxRetries)
+            {
+               datetime startWait = TimeCurrent();
+               while(TimeCurrent() - startWait < (RetryDelay * 2) / 1000.0)
+               {
+                  // Wait longer for trade context
+               }
+            }
+         }
+         else if(error == 4 || error == 2) // Server error or common error
+         {
+            if(attempt < MaxRetries)
+            {
+               datetime startWait = TimeCurrent();
+               while(TimeCurrent() - startWait < RetryDelay / 1000.0)
+               {
+                  // Retry
+               }
+            }
+         }
+         else
+         {
+            Print("CRITICAL ERROR: Cannot retry error ", error);
+            break; // Don't retry for critical errors
+         }
+      }
+   }
+   
+   if(ticket < 0)
+   {
+      Print("FAILED to open order after ", MaxRetries, " attempts!");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get total lot from both teams                                      |
+//+------------------------------------------------------------------+
+double GetTotalLot()
+{
+   double totalLot = 0;
+   
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+      {
+         if(OrderSymbol() == Symbol() && 
+            (OrderMagicNumber() == MagicNumberRed || OrderMagicNumber() == MagicNumberBlue))
+         {
+            totalLot += OrderLots();
+         }
+      }
+   }
+   
+   return totalLot;
+}
+
+//+------------------------------------------------------------------+
+//| Print active orders                                                |
+//+------------------------------------------------------------------+
+void PrintActiveOrders()
+{
+   double point = Point;
+   if(Digits == 5 || Digits == 3)
+   {
+      point = Point * 10;
+   }
+   
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+      {
+         if(OrderSymbol() == Symbol() && 
+            (OrderMagicNumber() == MagicNumberRed || OrderMagicNumber() == MagicNumberBlue))
+         {
+            string team = (OrderMagicNumber() == MagicNumberRed) ? "RED" : "BLUE";
+            string orderType = (OrderType() == OP_BUY) ? "BUY" : "SELL";
+            double slDistance = 0;
+            
+            if(OrderType() == OP_BUY)
+            {
+               slDistance = (OrderOpenPrice() - OrderStopLoss()) / point;
+            }
+            else
+            {
+               slDistance = (OrderStopLoss() - OrderOpenPrice()) / point;
+            }
+            
+            Print("Team ", team, " | #", OrderTicket(), " | ", orderType, 
+                  " | Lot: ", DoubleToString(OrderLots(), 2),
+                  " | SL: ", DoubleToString(slDistance, 1), " pips",
+                  " | Profit: $", DoubleToString(OrderProfit(), 2));
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Count orders by magic number                                       |
+//+------------------------------------------------------------------+
+int CountOrders(int magicNumber)
+{
+   int count = 0;
+   
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+      {
+         if(OrderSymbol() == Symbol() && OrderMagicNumber() == magicNumber)
+         {
+            count++;
+         }
+      }
+   }
+   
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| Close all orders with retry mechanism + GetTickCount             |
+//+------------------------------------------------------------------+
+void CloseAllOrders()
+{
+   // ⚡ OPTIMIZATION: Refresh rates ONCE at the beginning
+   // This ensures we have fresh prices before starting to close orders
+   // Reduces "price changed" and "requote" errors on first attempt
+   RefreshRates();
+   
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+      {
+         if(OrderSymbol() == Symbol() && 
+            (OrderMagicNumber() == MagicNumberRed || OrderMagicNumber() == MagicNumberBlue))
+         {
+            int ticket = OrderTicket();
+            double orderLots = OrderLots();
+            int orderType = OrderType();
+            bool result = false;
+            int attempt = 0;
+            
+            // Get fresh price for THIS specific order (outside retry loop for first attempt)
+            double closePrice = (orderType == OP_BUY) ? Bid : Ask;
+            
+            while(attempt < MaxRetries && !result)
+            {
+               attempt++;
+               
+               // Only refresh on retry attempts (first attempt uses price from above)
+               if(attempt > 1)
+               {
+                  RefreshRates();
+                  closePrice = (orderType == OP_BUY) ? Bid : Ask;
+               }
+               
+               if(orderType == OP_BUY)
+               {
+                  result = OrderClose(ticket, orderLots, closePrice, 3, clrNONE);
+               }
+               else if(orderType == OP_SELL)
+               {
+                  result = OrderClose(ticket, orderLots, closePrice, 3, clrNONE);
+               }
+               
+               if(result)
+               {
+                  Print("Order closed successfully: Ticket #", ticket, " | Attempt: ", attempt);
+               }
+               else
+               {
+                  int error = GetLastError();
+                  Print("Close failed (Attempt ", attempt, "/", MaxRetries, "): Ticket #", ticket, " Error: ", error, " - ", ErrorDescription(error));
+                  
+                  if(error == 135) // Price changed
+                  {
+                     if(attempt < MaxRetries)
+                     {
+                        uint startTick = GetTickCount();
+                        while(GetTickCount() - startTick < (uint)RetryDelay)
+                        {
+                           // Retry quickly - price will be refreshed in next loop
+                        }
+                     }
+                  }
+                  else if(error == 136 || error == 138 || error == 146) // Off quotes, Requote, Context busy
+                  {
+                     if(attempt < MaxRetries)
+                     {
+                        uint startTick = GetTickCount();
+                        while(GetTickCount() - startTick < (uint)RetryDelay)
+                        {
+                           // Busy wait
+                        }
+                     }
+                  }
+                  else if(error == 8) // Too frequent requests
+                  {
+                     if(attempt < MaxRetries)
+                     {
+                        uint startTick = GetTickCount();
+                        while(GetTickCount() - startTick < (uint)(RetryDelay * 2))
+                        {
+                           // Wait longer
+                        }
+                     }
+                  }
+                  else
+                  {
+                     break; // Don't retry for critical errors
+                  }
+               }
+            }
+            
+            if(!result)
+            {
+               Print("WARNING: Failed to close order #", ticket, " after ", MaxRetries, " attempts");
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Reset EA to initial state                                          |
+//+------------------------------------------------------------------+
+void ResetEA()
+{
+   InitialBalance = AccountBalance();
+   IsInitialized = false;
+   
+   RedTeamDirection = "SELL";
+   BlueTeamDirection = "BUY";
+   RedLastLot = 0;
+   BlueLastLot = 0;
+   
+   AghanimActive = false;
+   TotalLossFromInitial = 0;
+   BalanceAtAghanimActivation = 0;
+   AghanimTriggeredRed = false;
+   AghanimTriggeredBlue = false;
+   
+   TickCounter = 0;
+   
+   Print("========================================");
+   Print("EA Reset. New Initial Balance: $", DoubleToString(InitialBalance, 2));
+   Print("Aghanim's Scepter: ", EnableAghanimScepter ? "ENABLED" : "DISABLED");
+   Print("========================================");
+}
+
+//+------------------------------------------------------------------+
+//| Error Description Helper                                           |
+//+------------------------------------------------------------------+
+string ErrorDescription(int error)
+{
+   switch(error)
+   {
+      case 2: return "Common error";
+      case 4: return "Trade server busy";
+      case 6: return "No connection";
+      case 8: return "Too frequent requests";
+      case 128: return "Trade timeout";
+      case 129: return "Invalid price";
+      case 130: return "Invalid stops";
+      case 131: return "Invalid volume";
+      case 132: return "Market closed";
+      case 133: return "Trade disabled";
+      case 134: return "Not enough money";
+      case 135: return "Price changed";
+      case 136: return "Off quotes";
+      case 137: return "Broker busy";
+      case 138: return "Requote";
+      case 139: return "Order locked";
+      case 141: return "Too many requests";
+      case 145: return "Modification denied";
+      case 146: return "Trade context busy";
+      case 147: return "Expiration denied";
+      case 148: return "Too many orders";
+      default: return "Unknown error";
+   }
+}
+//+------------------------------------------------------------------+
